@@ -1,0 +1,125 @@
+"""Product comparison."""
+import logging
+
+from flask import Blueprint, jsonify
+
+from api_utils import ApiError, get_json_body, require_int
+from extensions import db
+from models import Product
+from services import gemini_service
+from services.gemini_service import GeminiError
+from services.price_service import get_price_comparison
+from services.recommendation_service import product_context
+
+bp = Blueprint("comparisons", __name__, url_prefix="/api")
+logger = logging.getLogger(__name__)
+
+
+def _price(p):
+    best = p.best_price()
+    return float(best.amount) if best else None
+
+
+def build_table(products):
+    """Deterministic comparison table + highlights computed from DB data."""
+    spec_keys = []
+    for p in products:
+        for k in (p.specs or {}):
+            if k not in spec_keys:
+                spec_keys.append(k)
+
+    rows = [
+        {"label": "Price", "values": [
+            f"₹{_price(p):,.0f}" if _price(p) is not None else "N/A" for p in products]},
+        {"label": "Price type", "values": [
+            "Sample (demo)" if (p.best_price() and p.best_price().is_sample) else
+            ("Verified" if p.best_price() and p.best_price().is_verified else "Unverified")
+            for p in products]},
+        {"label": "Brand", "values": [p.brand for p in products]},
+        {"label": "Category", "values": [p.category for p in products]},
+        {"label": "Rating", "values": [f"{p.rating}/5 ({p.rating_count})" for p in products]},
+        {"label": "Availability", "values": [
+            "In stock (sample)" if p.in_stock else "Out of stock (sample)" for p in products]},
+        {"label": "Features", "values": [", ".join(p.features or []) or "—" for p in products]},
+    ]
+    for key in spec_keys:
+        rows.append({"label": key, "spec": True,
+                     "values": [str((p.specs or {}).get(key, "—")) for p in products]})
+    for row in rows:
+        row["differs"] = len(set(row["values"])) > 1
+
+    priced = [p for p in products if _price(p) is not None]
+    highlights = {}
+    if priced:
+        cheapest = min(priced, key=_price)
+        highlights["cheapest"] = cheapest.id
+        # value score: rating points per ₹10,000 (simple, transparent heuristic)
+        best_value = max(priced, key=lambda p: (p.rating or 0) / (_price(p) / 10000)
+                         if _price(p) else 0)
+        highlights["best_value"] = best_value.id
+    highlights["highest_rated"] = max(products, key=lambda p: p.rating or 0).id
+    return rows, highlights
+
+
+def fallback_summary(products, highlights):
+    by_id = {p.id: p for p in products}
+    parts = []
+    if "cheapest" in highlights:
+        c = by_id[highlights["cheapest"]]
+        parts.append(f"{c.name} has the lowest sample price (₹{_price(c):,.0f}).")
+    h = by_id[highlights["highest_rated"]]
+    parts.append(f"{h.name} has the highest sample rating ({h.rating}/5).")
+    if "best_value" in highlights:
+        v = by_id[highlights["best_value"]]
+        parts.append(f"{v.name} offers the most rating points per rupee among the selection "
+                     "(a simple heuristic, not a verdict).")
+    return " ".join(parts)
+
+
+@bp.post("/compare")
+def compare():
+    body = get_json_body()
+    ids = body.get("product_ids")
+    if not isinstance(ids, list) or not 2 <= len(ids) <= 4:
+        raise ApiError("'product_ids' must be a list of 2 to 4 product IDs", 400,
+                       "validation_error")
+    ids = list(dict.fromkeys(require_int(i, "product_ids[]", minimum=1) for i in ids))
+    if len(ids) < 2:
+        raise ApiError("Select at least two different products", 400, "validation_error")
+    products = []
+    for pid in ids:
+        product = db.session.get(Product, pid)
+        if product is None:
+            raise ApiError(f"Product {pid} not found", 404, "not_found")
+        products.append(product)
+
+    rows, highlights = build_table(products)
+    summary = None
+    source, reason = "rules", None
+    if gemini_service.is_configured():
+        try:
+            ai = gemini_service.compare([product_context(p) for p in products])
+            summary = {**ai, "text": ai["summary"]}
+            source = "gemini"
+        except GeminiError as exc:
+            logger.warning("Compare fallback: %s", exc)
+            reason = "ai_error"
+    else:
+        reason = "ai_not_configured"
+    if summary is None:
+        summary = {"text": fallback_summary(products, highlights), "summary": None,
+                   "best_value": None, "key_differences": [], "value_for_money": []}
+
+    return jsonify({
+        "products": [p.to_dict(detail=True) for p in products],
+        "rows": rows,
+        "highlights": highlights,
+        "price_comparisons": {str(p.id): get_price_comparison(p) for p in products},
+        "summary": summary,
+        "source": source,
+        "ai_generated": source == "gemini",
+        "fallback_reason": reason,
+        "notice": ("Summary generated by Gemini from the product data shown."
+                   if source == "gemini" else
+                   "AI is unavailable; this summary was produced by simple rules, not Gemini."),
+    })
