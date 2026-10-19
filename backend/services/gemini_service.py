@@ -63,7 +63,7 @@ def _call_model(prompt: str, json_mode: bool) -> str:
         raise
     except Exception as exc:  # network, quota/rate limit, auth, timeout, ...
         # Log the type only; never log the key or full request.
-        logger.warning("Gemini call failed: %s", type(exc).__name__)
+        logger.error("Gemini call failed: %s", type(exc).__name__)
         raise GeminiError(f"Gemini request failed ({type(exc).__name__})") from exc
     if not text:
         raise GeminiError("Gemini returned an empty response")
